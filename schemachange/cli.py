@@ -21,7 +21,7 @@ from pandas import DataFrame
 
 #region Global Variables
 # metadata
-_schemachange_version = '3.5.4'
+_schemachange_version = '3.5.5'
 _config_file_name = 'schemachange-config.yml'
 _metadata_database_name = 'METADATA'
 _metadata_schema_name = 'SCHEMACHANGE'
@@ -58,6 +58,7 @@ _log_skip_r ="Skipping change script {script_name} because there is no change si
   + "execution"
 _log_apply =  "Applying change script {script_name}"
 _log_undo =  "Applying undo script {script_name}"
+_log_recalculate = "Recalculate checksum for change script {script_name}"
 _log_apply_set_complete  =  "Successfully applied {scripts_applied} change scripts (skipping " \
   + "{scripts_skipped}) \nCompleted successfully"
 _log_undo_set_complete  =  "Successfully applied {scripts_applied} undo scripts"
@@ -469,8 +470,7 @@ class SnowflakeSchemachangeSession:
     query = self._q_ch_log.format(**frmt_args)
     self.execute_snowflake_query(query)
 
-
-def deploy_command(config):
+def setup_session(config):
   req_args = set(['snowflake_account','snowflake_user','snowflake_role','snowflake_warehouse'])
   validate_auth_config(config, req_args)
 
@@ -480,11 +480,9 @@ def deploy_command(config):
   print(_log_config_details.format(**config))
 
   #connect to snowflake and maintain connection
-  session = SnowflakeSchemachangeSession(config)
+  return SnowflakeSchemachangeSession(config)
 
-  scripts_skipped = 0
-  scripts_applied = 0
-
+def calculate_repeatable_migration_checksum(config, session):
   # Deal with the change history table (create if specified)
   change_history_table = get_change_history_table_details(config['change_history_table'])
   change_history_metadata = session.fetch_change_history_metadata(change_history_table)
@@ -514,15 +512,20 @@ def deploy_command(config):
     max_published_version_display = 'None'
   print(_log_ch_max_version.format(max_published_version_display=max_published_version_display))
 
-  # Find all scripts in the root folder (recursively) and sort them correctly
-  all_scripts = get_all_scripts_recursively(config['root_folder'], config['verbose'])
-  all_script_names = list(all_scripts.keys())
-  # Sort scripts such that versioned scripts get applied first and then the repeatable ones.
-  all_script_names_sorted =   sorted_alphanumeric([script for script in all_script_names if script[0] == 'V']) \
-                            + sorted_alphanumeric([script for script in all_script_names if script[0] == 'R']) \
-                            + sorted_alphanumeric([script for script in all_script_names if script[0] == 'A'])
+  return [change_history_table, r_scripts_checksum, max_published_version]
 
-  # Loop through each script in order and apply any required changes
+def apply_scripts(config, all_scripts, all_script_names_sorted, apply = True):
+  session = setup_session(config)
+
+  scripts_skipped = 0
+  scripts_applied = 0
+
+  [
+    change_history_table,
+    r_scripts_checksum,
+    max_published_version
+  ] = calculate_repeatable_migration_checksum(config, session)
+
   for script_name in all_script_names_sorted:
     script = all_scripts[script_name]
 
@@ -556,26 +559,36 @@ def deploy_command(config):
         scripts_skipped += 1
         continue
 
-    print(_log_apply.format(**script))
+    if apply:
+      print(_log_apply.format(**script))
+    else:
+      print(_log_recalculate.format(**script))
 
     if not config['dry_run']:
-      execution_time = session.apply_change_script(script, content, change_history_table)
+      execution_time = 0
+      if apply:
+        execution_time = session.apply_change_script(script, content, change_history_table)
       session.record_change_script(script, content, change_history_table, execution_time)
       scripts_applied += 1
+
+  return [scripts_skipped, scripts_applied]
+
+def deploy_command(config):
+  # Find all scripts in the root folder (recursively) and sort them correctly
+  all_scripts = get_all_scripts_recursively(config['root_folder'], config['verbose'])
+  all_script_names = list(all_scripts.keys())
+  # Sort scripts such that versioned scripts get applied first and then the repeatable ones.
+  all_script_names_sorted =   sorted_alphanumeric([script for script in all_script_names if script[0] == 'V']) \
+                            + sorted_alphanumeric([script for script in all_script_names if script[0] == 'R']) \
+                            + sorted_alphanumeric([script for script in all_script_names if script[0] == 'A'])
+
+  # Loop through each script in order and apply any required changes
+  [scripts_skipped, scripts_applied] = apply_scripts(config, all_scripts, all_script_names_sorted, True)
 
   print(_log_apply_set_complete.format(scripts_applied=scripts_applied, scripts_skipped=scripts_skipped))
 
 def undo_command(config):
-  req_args = set(['snowflake_account','snowflake_user','snowflake_role','snowflake_warehouse', 'step'])
-  validate_auth_config(config, req_args)
-
-  # Log some additional details
-  if config['dry_run']:
-    print("Running in dry-run mode")
-  print(_log_config_details.format(**config))
-
-  #connect to snowflake and maintain connection
-  session = SnowflakeSchemachangeSession(config)
+  session = setup_session(config)
 
   # Deal with the change history table (raise if not provided)
   change_history_table = get_change_history_table_details(config['change_history_table'])
@@ -612,6 +625,17 @@ def undo_command(config):
       scripts_applied += 1
 
   print(_log_undo_set_complete.format(scripts_applied=scripts_applied))
+
+def recalculate_checksum_command(config):
+  # Find all scripts in the root folder (recursively) and sort them correctly
+  all_scripts = get_all_scripts_recursively(config['root_folder'], config['verbose'])
+  all_script_names = list(all_scripts.keys())
+  # Sort scripts such that versioned scripts get applied first and then the repeatable ones.
+  all_script_names_sorted = sorted_alphanumeric([script for script in all_script_names if script[0] == 'R'])
+
+  [scripts_applied, scripts_skipped] = apply_scripts(config, all_scripts, all_script_names_sorted, False)
+
+  print(_log_apply_set_complete.format(scripts_applied=scripts_applied, scripts_skipped=scripts_skipped))
 
 def render_command(config, script_path):
   """
@@ -894,6 +918,24 @@ def main(argv=sys.argv):
   parser = argparse.ArgumentParser(prog = 'schemachange', description = 'Apply schema changes to a Snowflake account. Full readme at https://github.com/Snowflake-Labs/schemachange', formatter_class = argparse.RawTextHelpFormatter)
   subcommands = parser.add_subparsers(dest='subcommand')
 
+  parser_undo = subcommands.add_parser("recalculate_checksum")
+  parser_undo.add_argument('--config-folder', type = str, default = '.', help = 'The folder to look in for the schemachange-config.yml file (the default is the current working directory)', required = False)
+  parser_undo.add_argument('-s', '--step', type = int, default = 1, help = 'Amount of versioned migrations to be undone in the reverse of their applied order', required = False)
+  parser_undo.add_argument('-f', '--root-folder', type = str, help = 'The root folder for the database change scripts', required = False)
+  parser_undo.add_argument('-m', '--modules-folder', type = str, help = 'The modules folder for jinja macros and templates to be used across multiple scripts', required = False)
+  parser_undo.add_argument('-a', '--snowflake-account', type = str, help = 'The name of the snowflake account (e.g. xy12345.east-us-2.azure)', required = False)
+  parser_undo.add_argument('-u', '--snowflake-user', type = str, help = 'The name of the snowflake user', required = False)
+  parser_undo.add_argument('-r', '--snowflake-role', type = str, help = 'The name of the default role to use', required = False)
+  parser_undo.add_argument('-w', '--snowflake-warehouse', type = str, help = 'The name of the default warehouse to use. Can be overridden in the change scripts.', required = False)
+  parser_undo.add_argument('-d', '--snowflake-database', type = str, help = 'The name of the default database to use. Can be overridden in the change scripts.', required = False)
+  parser_undo.add_argument('-c', '--change-history-table', type = str, help = 'Used to override the default name of the change history table (the default is METADATA.SCHEMACHANGE.CHANGE_HISTORY)', required = False)
+  parser_undo.add_argument('--vars', type = json.loads, help = 'Define values for the variables to replaced in change scripts, given in JSON format (e.g. {"variable1": "value1", "variable2": "value2"})', required = False)
+  parser_undo.add_argument('-ac', '--autocommit', action='store_true', help = 'Enable autocommit feature for DML commands (the default is False)', required = False)
+  parser_undo.add_argument('-v','--verbose', action='store_true', help = 'Display verbose debugging details during execution (the default is False)', required = False)
+  parser_undo.add_argument('--dry-run', action='store_true', help = 'Run schemachange in dry run mode (the default is False)', required = False)
+  parser_undo.add_argument('--query-tag', type = str, help = 'The string to add to the Snowflake QUERY_TAG session value for each query executed', required = False)
+  parser_undo.add_argument('--oauth-config', type = json.loads, help = 'Define values for the variables to Make Oauth Token requests  (e.g. {"token-provider-url": "https//...", "token-request-payload": {"client_id": "GUID_xyz",...},... })', required = False)
+
   parser_undo = subcommands.add_parser("undo")
   parser_undo.add_argument('--config-folder', type = str, default = '.', help = 'The folder to look in for the schemachange-config.yml file (the default is the current working directory)', required = False)
   parser_undo.add_argument('-s', '--step', type = int, default = 1, help = 'Amount of versioned migrations to be undone in the reverse of their applied order', required = False)
@@ -942,7 +984,7 @@ def main(argv=sys.argv):
   # The original parameters did not support subcommands. Check if a subcommand has been supplied
   # if not default to deploy to match original behaviour.
   args = argv[1:]
-  if len(args) == 0 or not any(subcommand in args[0].upper() for subcommand in ["DEPLOY", "RENDER", "UNDO"]):
+  if len(args) == 0 or not any(subcommand in args[0].upper() for subcommand in ["DEPLOY", "RENDER", "UNDO", "RECALCULATE_CHECKSUM"]):
     args = ["deploy"] + args
 
   args = parser.parse_args(args)
@@ -963,6 +1005,8 @@ def main(argv=sys.argv):
       "snowflake_warehouse":None,"snowflake_database":None,"change_history_table":None, \
       "create_change_history_table":None,"autocommit":None,"dry_run":None,"query_tag":None,"oauth_config":None,"step":None }
   elif args.subcommand == 'undo':
+    renderoveride = {"create_change_history_table":None}
+  elif args.subcommand == 'recalculate_checksum':
     renderoveride = {"create_change_history_table":None}
   elif args.subcommand == 'deploy':
     renderoveride = {"step":None}
@@ -997,6 +1041,8 @@ def main(argv=sys.argv):
     render_command(config, args.script)
   elif args.subcommand == 'undo':
     undo_command(config)
+  elif args.subcommand == 'recalculate_checksum':
+    recalculate_checksum_command(config)
   else:
     deploy_command(config)
 
