@@ -1,4 +1,4 @@
-FROM python:3.9
+FROM public.ecr.aws/docker/library/python:3.9
 
 WORKDIR /build
 
@@ -10,7 +10,7 @@ RUN pip3 install --upgrade setuptools wheel
 RUN python3 setup.py bdist_wheel
 
 
-FROM python:3.9
+FROM public.ecr.aws/docker/library/python:3.9
 
 COPY --from=0 /build/dist/schemachange-*-py3-none-any.whl /tmp/
 RUN pip3 install /tmp/schemachange-*-py3-none-any.whl && rm /tmp/schemachange-*-py3-none-any.whl
